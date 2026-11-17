@@ -178,6 +178,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_UMBP_L1_FETCH": lambda: os.getenv("ATOM_UMBP_L1_FETCH", "1") == "1",
     # Overrides the derived share group (pools exchange blocks within a group).
     "ATOM_UMBP_L1_GROUP": lambda: os.getenv("ATOM_UMBP_L1_GROUP", ""),
+    # 1 enables group-unit eviction: evicting one pool's copy of a block evicts
+    # all other pools' copies in the same group. Use for TP where every rank
+    # shard is needed for a cache hit.
+    "ATOM_UMBP_GROUP_EVICT_AS_UNIT": lambda: os.getenv("ATOM_UMBP_GROUP_EVICT_AS_UNIT", "0") == "1",
     # Protect reused KV prefixes from one-off prefill scans. Opt-in.
     "ATOM_PREFIX_CACHE_POLICY": lambda: os.getenv("ATOM_PREFIX_CACHE_POLICY", "lru"),
     "ATOM_PREFIX_CACHE_PROTECTED_RATIO": lambda: float(

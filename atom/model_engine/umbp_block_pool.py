@@ -635,4 +635,8 @@ def make_umbp_pool_memory(config, rank: int = 0) -> UmbpPoolMemory:
             "attention within a rank is not supported yet"
         )
     _, client = _connect()
-    return UmbpPoolMemory(client, pool_id_for(config, rank), share_group_for(config))
+    group = share_group_for(config)
+    if envs.ATOM_UMBP_GROUP_EVICT_AS_UNIT:
+        client.set_group_eviction_policy(group, True)
+        logger.info("UMBP group %s: evict_as_unit enabled", group)
+    return UmbpPoolMemory(client, pool_id_for(config, rank), group)
