@@ -1437,6 +1437,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC": lambda: _finite_float_env(
         "ATOM_OFFLOAD_EARLY_LOAD_MAX_FRAC", 0.15, allow_zero=True
     ),
+    # The prefill delayer's pending tokens count a waiting request past its
+    # HBM prefix hit (the admission probe), not at its whole prompt. Fuller
+    # prefill forwards, later first tokens. Off: the upper bound.
+    "ATOM_PROBED_PENDING": lambda: os.getenv("ATOM_PROBED_PENDING", "0") == "1",
     # Minimum external-tier hit worth loading, in tokens. None when unset: each
     # tier then uses its own default (`KVConnectorFactory.resolve_min_load_tokens`).
     "OFFLOAD_MIN_LOAD_TOKENS": lambda: _non_negative_or_none(

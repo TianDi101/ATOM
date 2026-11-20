@@ -997,6 +997,9 @@ class Scheduler:
         self._inflight_prefix_wait: dict[int, int] = {}
         # Tier loads started early, and the skip reasons of those not started.
         self._early_load = EarlyLoadState()
+        # The delayer's pending tokens count a waiting request past its HBM
+        # prefix hit (`_waiting_new_token_count`).
+        self._probed_pending = envs.ATOM_PROBED_PENDING
         # (seq id, prompt tokens reused) of requests `share_cache` routing placed
         # on an estimated prefix, for the CoreManager (`_note_dp_reuse`).
         self.dp_reuse_reports: list[tuple] = []
@@ -1650,11 +1653,21 @@ class Scheduler:
         `num_cached_tokens` discount is best-effort:
         an un-admitted seq has not been probed against the prefix cache yet, so
         this is an upper bound on new tokens for cache-hit prompts.
+
+        With `ATOM_PROBED_PENDING` that bound is replaced by the admission
+        probe's HBM hit (`_probed_pending_prefill_tokens`): on an agentic
+        workload most waiting requests hit a long prefix, the bound counts each
+        at its whole prompt, and every rank with anything waiting reports a
+        full budget.
         """
         cap = self.max_num_batched_tokens
+        probed = self._probed_pending
         total = 0
         for seq in self._waiting_prefills():
-            num_new_tokens = self.pending_prefill_tokens(seq)
+            if probed:
+                num_new_tokens = self._probed_pending_prefill_tokens(seq)
+            else:
+                num_new_tokens = self.pending_prefill_tokens(seq)
             if (
                 not self.enable_chunked_prefill
                 and num_new_tokens > self.max_num_batched_tokens
@@ -1664,6 +1677,21 @@ class Scheduler:
             if total >= cap:
                 return cap
         return total
+
+    def _probed_pending_prefill_tokens(self, seq: Sequence) -> int:
+        """`pending_prefill_tokens` of a waiting request, with one not admitted
+        yet counted past its HBM prefix hit: the admission probe, memoised
+        across ticks. What a tier holds beyond that hit is not discounted (a
+        request that loads it is parked and counted by its loaded prefix), and
+        a request the pool cannot take now keeps the upper bound."""
+        pending = self.pending_prefill_tokens(seq)
+        if seq.block_table:
+            return pending
+        bm = self.block_manager
+        hit_blocks = bm.can_allocate_memoized(seq)
+        if hit_blocks <= 0:
+            return pending
+        return max(0, pending - hit_blocks * bm.hash_block_size)
 
     def _partial_prefill_remaining_tokens(self) -> int:
         """Sum of remaining (not-yet-computed) tokens across mid-chunked-prefill
