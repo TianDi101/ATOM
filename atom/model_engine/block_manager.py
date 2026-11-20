@@ -1417,6 +1417,9 @@ class BlockManager:
     def _walk_prefix(self, seq: Sequence) -> _PrefixWalk:
         """`seq`'s contiguous HBM prefix hit, the costly half of `can_allocate`."""
         if self.kv.shares_content and self.enable_prefix_caching:
+            # Apply any peer copies that completed since the last walk before
+            # firing a new one; the new request fires async (non-blocking).
+            self.kv.drain_fetches()
             self._fetch_shared_prefix(seq)
         prompt = self._prompt_hashes(seq)
         if self.fast_prefix_walk:
@@ -1460,7 +1463,9 @@ class BlockManager:
             local += 1
         if local == n:
             return
-        self.kv.fetch(chain[local:], lambda i: self._hash_block_tokens(seq, local + i))
+        self.kv.fetch_async(
+            chain[local:], lambda i: self._hash_block_tokens(seq, local + i)
+        )
 
     def _admission_walk(self, seq: Sequence) -> _PrefixWalk:
         """The exact probe's walk, kept on the fast walk for `seq`'s `allocate`

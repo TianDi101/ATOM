@@ -181,6 +181,30 @@ class KVBlockPool(ABC):
         """
         return 0
 
+    def fetch_async(
+        self, hashes: Sequence[int], tokens_of: Callable[[int], array.array]
+    ) -> None:
+        """Non-blocking variant of `fetch` for backends that support it.
+
+        Default falls back to the synchronous `fetch` so the local pool backend
+        needs no change.  Override in backends where the RPC is expensive enough
+        to block the scheduling loop (e.g. UMBP L1 peer copy).
+        """
+        self.fetch(hashes, tokens_of)
+
+    def drain_fetches(self) -> int:
+        """Apply completed async fetches submitted by `fetch_async`.
+
+        Call from the scheduler thread before every prefix walk.  Returns the
+        number of blocks that became resident.  No-op for the default backend.
+        """
+        return 0
+
+    @property
+    def has_async_fetch_pending(self) -> bool:
+        """True while at least one async fetch is still in-flight."""
+        return False
+
     def flush(self) -> None:
         """Push any deferred bookkeeping to the backend. Cheap when idle."""
 

@@ -34,6 +34,7 @@ Needs the `mori_umbp_l1` client module and a server at `ATOM_UMBP_L1_ADDRESS`.
 from __future__ import annotations
 
 import array
+import concurrent.futures
 import hashlib
 import json
 import logging
@@ -176,6 +177,13 @@ class UmbpBlockPool(KVBlockPool):
         self.blocks_fetched = 0
         self.bytes_fetched = 0
         self.fetch_seconds = 0.0
+        # Async fetch: a single background thread issues the UMBP RPC; the
+        # scheduler thread applies results via drain_fetches() before each walk.
+        self._fetch_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"umbp-fetch-{pool_id}"
+        )
+        # (future, hashes, tokens_of, start_time) in submission order.
+        self._async_fetches: deque = deque()
 
     # ------------------------------- counts -------------------------------- #
     @property
@@ -449,11 +457,101 @@ class UmbpBlockPool(KVBlockPool):
             )
         return len(slots)
 
+    def fetch_async(
+        self, hashes: Sequence[int], tokens_of: Callable[[int], array.array]
+    ) -> None:
+        """Fire-and-forget version of `fetch`: submits the UMBP RPC in a
+        background thread and returns immediately.
+
+        The scheduler thread stays off the critical path: it reaches the
+        delayer's all_reduce without waiting for the peer copy.  Call
+        `drain_fetches()` before the next prefix walk to apply any results that
+        have landed since the last call.
+        """
+        if not hashes:
+            return
+        # Deferred ops must reach UMBP before it decides which blocks to copy.
+        self.flush()
+        keys = [_key(h) for h in hashes]
+        started = time.perf_counter()
+        future = self._fetch_executor.submit(self._client.fetch, self.pool_id, keys)
+        self._async_fetches.append((future, list(hashes), tokens_of, started))
+
+    def drain_fetches(self) -> int:
+        """Apply completed async fetches to the local index.
+
+        Called from the scheduler thread before every prefix walk so that blocks
+        copied by a background fetch become visible to the walk.  Returns the
+        number of leading entries that have landed (stops at the first still
+        in-flight one to preserve order).
+        """
+        done = 0
+        while self._async_fetches:
+            future, hashes, tokens_of, started = self._async_fetches[0]
+            if not future.done():
+                break
+            self._async_fetches.popleft()
+            try:
+                slots, evicted, copied, copied_bytes, _ = future.result()
+            except Exception:
+                logger.exception("UMBP pool %s: async fetch failed", self.pool_id)
+                continue
+            index = self._hash_to_block_id
+            for key in evicted:
+                block_id = index.get(_hash(key))
+                if block_id is None or block_id in self._used:
+                    raise RuntimeError(
+                        f"UMBP pool {self.pool_id}: local view diverged "
+                        f"(UMBP evicted a block this view does not hold free)"
+                    )
+                self._forget(block_id)
+            for i, block_id in enumerate(slots):
+                h = hashes[i]
+                current = index.get(h)
+                if current == block_id:
+                    continue
+                if (
+                    current is not None
+                    or block_id in self._used
+                    or self._indexed(block_id)
+                ):
+                    raise RuntimeError(
+                        f"UMBP pool {self.pool_id}: local view diverged on "
+                        f"async fetch"
+                    )
+                block = self.blocks[block_id]
+                block.hash = h
+                block.token_ids = tokens_of(i)
+                index[h] = block_id
+                self._cached_free += 1
+            elapsed = time.perf_counter() - started
+            self.blocks_fetched += copied
+            self.bytes_fetched += copied_bytes
+            self.fetch_seconds += elapsed
+            if copied:
+                logger.info(
+                    "UMBP pool %s: async-fetched %d of %d blocks from peer "
+                    "pools (%.1f MiB in %.1f ms)",
+                    self.pool_id,
+                    copied,
+                    len(hashes),
+                    copied_bytes / (1 << 20),
+                    elapsed * 1e3,
+                )
+            done += len(slots)
+        return done
+
+    @property
+    def has_async_fetch_pending(self) -> bool:
+        """True while at least one async fetch is still in-flight."""
+        return bool(self._async_fetches) and not self._async_fetches[0][0].done()
+
     def close(self) -> None:
         try:
             self.flush()
         except Exception:  # noqa: BLE001 - the server may already be gone
             logger.debug("UMBP pool %s: flush on close failed", self.pool_id)
+        self._fetch_executor.shutdown(wait=False)
 
 
 class _DeviceBuffer:
