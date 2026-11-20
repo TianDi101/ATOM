@@ -1229,13 +1229,26 @@ class CoreManager:
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS, tier, config.max_num_seqs
             )
         if not tier.loads:
-            names = [name for name, _ in KVConnectorFactory.leaf_connectors(config)]
-            shared = sorted(KVConnectorFactory.shared_offload_connectors())
-            raise ValueError(
-                "--dp-load-balance share_cache needs an offload tier every DP "
-                f"rank shares and loads from ({', '.join(shared)}, kv_role "
-                f"offload or kv_both); the KV connectors are {names!r}"
-            )
+            # ATOM_KV_POOL_BACKEND=umbp with ATOM_UMBP_L1_FETCH=1: the pool
+            # copies blocks from peer ranks on demand (fetch_async), so the
+            # share_cache router may route to any rank — treat it as a tier
+            # that loads.
+            from atom.model_engine.kv_block_pool import UMBP_BACKEND, kv_pool_backend
+
+            if kv_pool_backend() == UMBP_BACKEND and envs.ATOM_UMBP_L1_FETCH:
+                from atom.kv_transfer.offload.tier import OffloadTierProfile
+
+                tier = OffloadTierProfile(
+                    loads=True, min_load_tokens=0, load_chunk_tokens=1
+                )
+            else:
+                names = [name for name, _ in KVConnectorFactory.leaf_connectors(config)]
+                shared = sorted(KVConnectorFactory.shared_offload_connectors())
+                raise ValueError(
+                    "--dp-load-balance share_cache needs an offload tier every DP "
+                    f"rank shares and loads from ({', '.join(shared)}, kv_role "
+                    f"offload or kv_both); the KV connectors are {names!r}"
+                )
         return ShareCacheRouter(tier, self._dp_lb_req_equiv)
 
     @property
