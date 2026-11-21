@@ -179,14 +179,44 @@ def _router_logits_fake(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.empty((x.shape[0], EXPERTS), dtype=torch.bfloat16, device=x.device)
 
 
+# tokens -> the width's CompiledFunction, for calls outside a graph capture.
+_COMPILED: dict = {}
+
+
+def _launch_untraced(tokens: int, args: tuple) -> bool:
+    """Launch the width's kernel without tracing it again. False when FlyDSL
+    gave no compiled function for it, and nothing was launched.
+
+    An ordinary call of a ``flyc.jit`` launcher traces the kernel before it
+    looks for its artifact, every time: about 20 ms for this one. A recorded
+    graph pays that once, at capture. A forward that runs as Python pays it in
+    every MoE layer of every step: a DP rank's dummy rows beside a peer's
+    prefill past the largest token-graph bucket are such a forward, and made
+    that group step last most of a second. The width's first such call goes
+    through ``flyc.compile``, which launches it; the ``CompiledFunction`` it
+    returns is called after that.
+    """
+    fn = _COMPILED.get(tokens)
+    if fn is not None:
+        fn(*args)
+        return True
+    fn = flyc.compile(_build(tokens), *args)
+    if fn is None:
+        return False
+    _COMPILED[tokens] = fn
+    return True
+
+
 @torch_compile_guard(gen_fake=_router_logits_fake, mutates_args=[])
 def router_logits(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """[T, 384] bf16 logits of ``x`` (``router_supported``)."""
-    out = torch.empty((x.shape[0], EXPERTS), dtype=torch.bfloat16, device=x.device)
-    _build(x.shape[0])(
-        x.data_ptr(),
-        weight.data_ptr(),
-        out.data_ptr(),
-        stream=torch.cuda.current_stream(),
-    )
+    tokens = x.shape[0]
+    out = torch.empty((tokens, EXPERTS), dtype=torch.bfloat16, device=x.device)
+    stream = torch.cuda.current_stream()
+    args = (x.data_ptr(), weight.data_ptr(), out.data_ptr())
+    # A capture keeps the launcher's own call, whose launch it records.
+    if torch.cuda.is_current_stream_capturing() or not _launch_untraced(
+        tokens, (*args, stream)
+    ):
+        _build(tokens)(*args, stream=stream)
     return out
