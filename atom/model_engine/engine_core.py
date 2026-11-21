@@ -616,6 +616,7 @@ class EngineCore:
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
+            self._pick_up_settled_loads()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -676,6 +677,28 @@ class EngineCore:
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
         return True
+
+    def _pick_up_settled_loads(self) -> None:
+        """Read load completions before scheduling, for a tier whose loads
+        finish inside one forward (`loads_settle_within_a_step`) while a
+        request is parked on one.
+
+        The poll after a forward returns the reply the workers wrote before
+        that forward (`call_func_with_aggregation` keeps one poll in flight),
+        so a load dispatched on tick k is otherwise seen after forward k+1 and
+        its request admitted on tick k+2. The reply to the poll started after
+        forward k is already queued here: reading it now admits the request on
+        tick k+1, one forward (a whole group prefill, if that is what k+1
+        runs) earlier.
+        """
+        scheduler = self.scheduler
+        parked = getattr(scheduler, "_num_parked_remote_kv", 0)
+        if not isinstance(parked, int) or parked <= 0:
+            return
+        connector = getattr(scheduler, "kv_connector", None)
+        if getattr(connector, "loads_settle_within_a_step", False) is not True:
+            return
+        self._poll_kv_transfer_progress()
 
     def _wait_for_kv_progress(self) -> None:
         # Work queued before the event was cleared must also prevent sleeping.

@@ -45,6 +45,9 @@ def engine_step(monkeypatch):
     engine._wait_for_kv_progress = lambda: engine_core.EngineCore._wait_for_kv_progress(
         engine
     )
+    engine._pick_up_settled_loads = (
+        lambda: engine_core.EngineCore._pick_up_settled_loads(engine)
+    )
     return engine_core, engine, batch, sleep
 
 
@@ -193,3 +196,44 @@ def test_forward_batch_keeps_forward_and_postprocess_without_sleep(engine_step):
     engine._poll_kv_transfer_progress.assert_called_once_with()
     engine._postprocess.assert_called_once()
     sleep.assert_not_called()
+
+
+def test_settled_load_is_picked_up_before_scheduling(engine_step):
+    module, engine, batch, _ = engine_step
+    order = []
+    engine.scheduler._num_parked_remote_kv = 1
+    engine.scheduler.kv_connector = SimpleNamespace(loads_settle_within_a_step=True)
+    engine._poll_kv_transfer_progress = Mock(
+        side_effect=lambda: order.append("poll") or False
+    )
+
+    def schedule():
+        order.append("schedule")
+        return batch, {}
+
+    engine.scheduler.schedule.side_effect = schedule
+
+    module.EngineCore._process_engine_step_inner(engine)
+
+    assert order[:2] == ["poll", "schedule"]
+
+
+@pytest.mark.parametrize(
+    ("parked", "connector"),
+    [
+        (0, SimpleNamespace(loads_settle_within_a_step=True)),
+        (2, SimpleNamespace(loads_settle_within_a_step=False)),
+        (2, SimpleNamespace()),
+        (2, None),
+    ],
+)
+def test_no_early_pickup_without_a_parked_load_on_a_settling_tier(
+    engine_step, parked, connector
+):
+    module, engine, _, _ = engine_step
+    engine.scheduler._num_parked_remote_kv = parked
+    engine.scheduler.kv_connector = connector
+
+    module.EngineCore._process_engine_step_inner(engine)
+
+    engine._poll_kv_transfer_progress.assert_called_once_with()

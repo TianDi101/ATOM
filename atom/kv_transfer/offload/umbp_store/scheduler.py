@@ -234,6 +234,11 @@ class UMBPStoreOffloadScheduler(KVStoreOffloadScheduler):
     LABEL = "UMBP offload"
     supports_early_load = True
     lowers_hbm_hit_to_chunk = True
+    # A load is a few milliseconds (get on a side stream, no forward-stream
+    # work), so it has settled by the time the forward it was dispatched
+    # beside returns: EngineCore reads its completion before the next
+    # schedule instead of one forward later (`_pick_up_settled_loads`).
+    loads_settle_within_a_step = True
 
     def offer_lookups(self, seqs):
         if not self._do_load:
