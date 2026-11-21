@@ -31,6 +31,11 @@ KEY_PREFIX = "umbp_store."
 _MIB = 1 << 20
 # UMBP's own: no key of this connector is ever a Mooncake Store key.
 NAMESPACE_PREFIX = "atomumbp1-"
+# How long a client waits for the server when it connects. Every rank
+# registers its pools with the one server as the engine starts, and a
+# registration has taken 26 s there; at 10 s the last rank to connect gave up
+# and the engine did not start (about one start in ten).
+DEFAULT_STARTUP_TIMEOUT_MS = 120_000
 
 UMBP_LAYOUTS = StoreLayouts(
     ("dense", "m3", "dsv41"),
@@ -116,7 +121,7 @@ def parse_umbp_store_config(
         address=_text(f"{KEY_PREFIX}address", address),
         startup_timeout_ms=offcfg._strict_integer(
             f"{KEY_PREFIX}startup_timeout_ms",
-            values.get("startup_timeout_ms", 10000),
+            values.get("startup_timeout_ms", DEFAULT_STARTUP_TIMEOUT_MS),
             minimum=1,
         ),
         chunk_tokens=offcfg.connector_integer(extra, f"{KEY_PREFIX}chunk_tokens", 256),

@@ -413,7 +413,7 @@ def test_config_defaults():
     cfg = parse_umbp_store_config({"kv_connector_extra_config": _extra()})
     assert cfg == UMBPStoreOffloadConfig(
         address=ADDRESS,
-        startup_timeout_ms=10000,
+        startup_timeout_ms=120_000,
         chunk_tokens=CHUNK,
         load_pool_mib=1024,
         save_pool_mib=256,
