@@ -48,6 +48,10 @@ class EarlyLoadState:
         self.wait_sum_s = 0.0
         self.wait_n = 0
         self.tick = 0
+        # seq id -> tick its load was submitted on, until its completion is
+        # first seen; then the ticks it took, by count (5 = five or more).
+        self._submit_tick: dict[Any, int] = {}
+        self.settle_ticks: Counter = Counter()
         self._last_log = time.monotonic()
 
     # -- counters -------------------------------------------------------------
@@ -60,17 +64,26 @@ class EarlyLoadState:
 
     def note_submitted(self, seq: Any) -> None:
         self.entries[seq.id] = (seq, time.monotonic())
+        self._submit_tick[seq.id] = self.tick
         self.submitted += 1
         self.submitted_total += 1
 
+    def note_settled(self, seq_id: Any) -> None:
+        """The scheduler first sees `seq_id`'s load completion, on this tick."""
+        submitted = self._submit_tick.pop(seq_id, None)
+        if submitted is not None:
+            self.settle_ticks[min(self.tick - submitted, 5)] += 1
+
     def note_prefill(self, seq_id: Any) -> None:
         """`seq_id` was put on a prefill batch: its early-load wait is over."""
+        self._submit_tick.pop(seq_id, None)
         entry = self.entries.pop(seq_id, None)
         if entry is not None:
             self.wait_sum_s += time.monotonic() - entry[1]
             self.wait_n += 1
 
     def note_gone(self, seq_id: Any, *, aborted: bool = False) -> None:
+        self._submit_tick.pop(seq_id, None)
         if self.entries.pop(seq_id, None) is not None and aborted:
             self.aborted += 1
 
@@ -100,7 +113,8 @@ class EarlyLoadState:
             "[EARLY-LOAD] last %.0fs: submitted=%d (total %d) "
             "skipped_by_limit=%s skipped_by_condition=%s aborted=%d "
             "| held_blocks=%d (%.1f%% of %d) held_requests=%d "
-            "| to_prefill n=%d avg_wait=%.0fms",
+            "| to_prefill n=%d avg_wait=%.0fms "
+            "| settled after ticks %s",
             self.LOG_INTERVAL_S,
             self.submitted,
             self.submitted_total,
@@ -113,7 +127,9 @@ class EarlyLoadState:
             len(self.entries),
             self.wait_n,
             wait_ms,
+            dict(sorted(self.settle_ticks.items())),
         )
+        self.settle_ticks.clear()
         self.skips.clear()
         self.submitted = 0
         self.aborted = 0

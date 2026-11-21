@@ -691,6 +691,8 @@ class EngineCore:
         tick k+1, one forward (a whole group prefill, if that is what k+1
         runs) earlier.
         """
+        if not envs.OFFLOAD_PICKUP_BEFORE_SCHEDULE:
+            return
         scheduler = self.scheduler
         parked = getattr(scheduler, "_num_parked_remote_kv", 0)
         if not isinstance(parked, int) or parked <= 0:

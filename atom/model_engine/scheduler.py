@@ -5664,6 +5664,11 @@ class Scheduler:
                 and self._is_offload_prefill_resume(seq)
             )
 
+        if recving:
+            for seq_id in early:
+                if str(seq_id) in recving:
+                    self._early_load.note_settled(seq_id)
+
         # O(early loads), not O(waiting): an early load in flight leaves the
         # queue as it is.
         settled_early = any(completed(seq) for seq, _ in early.values())

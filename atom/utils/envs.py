@@ -1465,6 +1465,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # How long admission may pass over a request whose async lookup has not
     # answered; after it `lmcache_mp` waits for the answer and the Mooncake
     # Store admits the request without one.
+    # A tier whose loads settle within a step (`loads_settle_within_a_step`)
+    # has its completions read before each schedule while a request is parked
+    # on one. 0: only after the forward, as for every other tier.
+    "OFFLOAD_PICKUP_BEFORE_SCHEDULE": lambda: _flag_env(
+        "OFFLOAD_PICKUP_BEFORE_SCHEDULE", "1"
+    ),
     "OFFLOAD_LOOKUP_DEFER_S": lambda: _finite_float_env(
         "OFFLOAD_LOOKUP_DEFER_S", 2.0, allow_zero=True
     ),
