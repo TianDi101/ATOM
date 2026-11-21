@@ -108,6 +108,10 @@ def register_backends(factory) -> None:
         scheduler_class="UMBPStoreOffloadScheduler",
         requires_pd_staging=False,
         offload=True,
+        # As `mooncake_store`. Left to the 8192 default, a tier hit under 8192
+        # tokens is recomputed and its request reaches the delayer counted at
+        # its whole prompt.
+        min_load_tokens=512,
         # One UMBP standalone server per node, shared by every DP rank there.
         shared_tier=True,
         chunk_tokens="atom.kv_transfer.offload.umbp_store.config:store_chunk_tokens",
