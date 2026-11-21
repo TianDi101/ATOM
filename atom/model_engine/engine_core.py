@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 import pickle
 import queue
 import threading
@@ -52,6 +53,105 @@ from atom.utils.gc_utils import (
 )
 
 logger = logging.getLogger("atom")
+
+
+class _TickDiag:
+    """DIAGNOSTIC ONLY (ATOM_TICK_DIAG=1): where a DP engine core's tick goes.
+
+    Per tick, on the engine core's own thread: the lockstep sync
+    (`_sync_dp_state`, split into waiting for the last rank to arrive and the
+    collective itself -- every rank puts its arrival time into the MAX
+    all_reduce), `schedule()`, the forward call, and the postprocess. One line
+    per prefill step (ticks line up across ranks by `tick`), one per
+    `EVERY` decode ticks.
+    """
+
+    EVERY = 1000
+
+    def __init__(self, rank: int):
+        self.rank = rank
+        self.tick = 0
+        self.t0 = self.t1 = self.t2 = 0.0
+        self.sync_ms = self.late_ms = 0.0
+        self.latest = False
+        self._clear()
+
+    def _clear(self) -> None:
+        self.n = self.n_latest = self.seqs = self.n_dummy = 0
+        self.sched = self.fwd = self.post = self.sync = self.late = 0.0
+        self.dummy = 0.0
+
+    def synced(self, t_in_us: int, latest_us: int, t_out_us: int) -> None:
+        self.tick += 1
+        self.sync_ms = (t_out_us - t_in_us) / 1e3
+        self.late_ms = (latest_us - t_in_us) / 1e3
+        self.latest = latest_us == t_in_us
+
+    def stepped(self, batch, t3: float) -> None:
+        sched = (self.t1 - self.t0) * 1e3
+        fwd = (self.t2 - self.t1) * 1e3
+        post = (t3 - self.t2) * 1e3
+        if batch.total_seqs_num_prefill > 0:
+            logger.info(
+                "[TICK] prefill rank=%d tick=%d tokens=%d decode_seqs=%d "
+                "sync_ms=%.2f late_ms=%.2f latest=%d sched_ms=%.2f fwd_ms=%.2f "
+                "post_ms=%.2f",
+                self.rank,
+                self.tick,
+                batch.total_tokens_num_prefill,
+                batch.total_seqs_num_decode,
+                self.sync_ms,
+                self.late_ms,
+                self.latest,
+                sched,
+                fwd,
+                post,
+            )
+            return
+        self.n += 1
+        self.n_latest += self.latest
+        self.seqs += batch.total_seqs_num_decode
+        self.sched += sched
+        self.fwd += fwd
+        self.post += post
+        self.sync += self.sync_ms
+        self.late += self.late_ms
+        if self.n >= self.EVERY:
+            self._report()
+
+    def dummied(self, t_start: float, t_end: float) -> None:
+        self.n_dummy += 1
+        self.dummy += (t_end - t_start) * 1e3
+        logger.info(
+            "[TICK] dummy rank=%d tick=%d sync_ms=%.2f late_ms=%.2f latest=%d "
+            "dummy_ms=%.2f",
+            self.rank,
+            self.tick,
+            self.sync_ms,
+            self.late_ms,
+            self.latest,
+            (t_end - t_start) * 1e3,
+        )
+
+    def _report(self) -> None:
+        n = self.n
+        logger.info(
+            "[TICK] decode rank=%d tick=%d n=%d seqs=%.1f sync_ms=%.3f "
+            "late_ms=%.3f latest=%.2f sched_ms=%.3f fwd_ms=%.3f post_ms=%.3f "
+            "(means per decode tick)",
+            self.rank,
+            self.tick,
+            n,
+            self.seqs / n,
+            self.sync / n,
+            self.late / n,
+            self.n_latest / n,
+            self.sched / n,
+            self.fwd / n,
+            self.post / n,
+        )
+        self._clear()
+
 
 # Pace of the idle KV drain. The busy loops never block, so an unpaced drain
 # would fire one worker RPC round per spin; 1ms matches the PP head's existing
@@ -597,6 +697,9 @@ class EngineCore:
         # waiting. Arrivals during this step remain latched until the next step.
         if self.kv_transfer_enabled:
             self._kv_progress_event.clear()
+        diag = getattr(self, "_tick_diag", None)
+        if diag is not None:
+            diag.t0 = time.monotonic()
         result = self.scheduler.schedule()
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
@@ -632,9 +735,13 @@ class EngineCore:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             tracing.record_forward(scheduled_batch, seqs)
             self.scheduler.metrics.record_forward(scheduled_batch, seqs)
+            if diag is not None:
+                diag.t1 = time.monotonic()
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            if diag is not None:
+                diag.t2 = time.monotonic()
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -656,6 +763,8 @@ class EngineCore:
             return False
 
         self._postprocess(seqs.values(), fwd_out, scheduled_batch)
+        if diag is not None:
+            diag.stepped(scheduled_batch, time.monotonic())
         return True
 
     def _wait_for_kv_progress(self) -> None:
@@ -1061,6 +1170,10 @@ class DPEngineCoreProc(EngineCore):
         # self.dp_group = config.parallel_config.stateless_init_dp_group()
         super().__init__(config, input_address, output_address)
         self._shutting_down = False
+        # DIAGNOSTIC tree only; read here, not through `envs`, on purpose.
+        self._tick_diag = (
+            _TickDiag(self.dp_rank) if os.getenv("ATOM_TICK_DIAG") == "1" else None
+        )
 
         self._init_prefill_delayer(config, self.dp_group)
         # `share_cache` routing reads each rank's own prefill backlog.
@@ -1170,7 +1283,11 @@ class DPEngineCoreProc(EngineCore):
                 tracing.shutdown()
 
     def _execute_dummy_batch(self):
+        diag = getattr(self, "_tick_diag", None)
+        t_start = time.monotonic()
         fwd_out = self.runner_mgr.call_func("dummy_execution", wait_out=True)
+        if diag is not None:
+            diag.dummied(t_start, time.monotonic())
         if self.scheduler.running:
             # The tokens this rank's last real step sampled come back with this
             # forward (deferred output), and land like any step's.
@@ -1186,11 +1303,16 @@ class DPEngineCoreProc(EngineCore):
             return local_has_unfinished, True, local_held
 
         try:
+            # DIAGNOSTIC: this rank's arrival time rides the MAX reduce, so the
+            # result says when the last rank arrived (one host, one clock).
+            diag = getattr(self, "_tick_diag", None)
+            t_in_us = time.monotonic_ns() // 1000 if diag is not None else 0
             state_tensor = torch.tensor(
                 [
                     1 if local_has_unfinished else 0,
                     1 if local_shutdown else 0,
                     1 if local_held else 0,
+                    t_in_us,
                 ],
                 dtype=torch.int64,
                 device="cpu",
@@ -1198,6 +1320,8 @@ class DPEngineCoreProc(EngineCore):
             torch.distributed.all_reduce(
                 state_tensor, op=torch.distributed.ReduceOp.MAX, group=self.dp_group
             )
+            if diag is not None:
+                diag.synced(t_in_us, int(state_tensor[3]), time.monotonic_ns() // 1000)
             global_has_unfinished = state_tensor[0].item() == 1
             global_shutdown = state_tensor[1].item() == 1
             global_held = state_tensor[2].item() == 1
